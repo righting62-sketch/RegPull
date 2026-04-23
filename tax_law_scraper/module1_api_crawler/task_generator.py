@@ -1,23 +1,47 @@
 """
-任务生成主逻辑
+任务生成主逻辑 - 增强版反爬虫策略
 """
 import json
+import random
+import time
 from typing import List, Dict
 from .api_fetcher import APIFetcher
 from database.db_manager import TaxDocumentDB
 from config.category_mapping import CATEGORY_MAPPING, CATEGORY_NAMES
-from config.settings import DB_PATH
+from config.settings import DB_PATH, REQUEST_CONFIG
 from utils.helpers import generate_doc_id, parse_date
 from utils.logger import setup_logger
 
 
 class TaskGenerator:
-    """任务生成器"""
+    """任务生成器 - 增强版"""
 
     def __init__(self):
         self.api_fetcher = APIFetcher()
         self.db = TaxDocumentDB(DB_PATH)
         self.logger = setup_logger('module1', 'module1.log')
+        self.total_pages_processed = 0
+        self.total_items_saved = 0
+
+    def _page_delay(self):
+        """页面间延迟"""
+        delay = random.uniform(
+            REQUEST_CONFIG['page_delay_min'],
+            REQUEST_CONFIG['page_delay_max']
+        )
+        print(f"💤 页面间休眠 {delay:.2f} 秒以规避风控...\n")
+        time.sleep(delay)
+
+    def _print_progress(self, current: int, total: int, success: int):
+        """打印进度"""
+        progress = (current / total * 100) if total > 0 else 0
+        bar_length = 40
+        filled = int(bar_length * current / total) if total > 0 else 0
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        print(f"\r进度: [{bar}] {progress:.1f}% | 已处理: {current}/{total} | 已入库: {success}", end='')
+        if current == total:
+            print()
 
     def generate_tasks(self, category_key: str = None, max_pages: int = None):
         """
@@ -41,37 +65,56 @@ class TaskGenerator:
 
             total_count = 0
             success_count = 0
+            failed_pages = []
 
             for page in range(1, total_pages + 1):
-                print(f"\n正在获取第 {page}/{total_pages} 页...")
+                print(f"\n⏳ 正在获取第 {page}/{total_pages} 页...")
 
                 response = self.api_fetcher.fetch_list(channel_id, page)
 
                 if not response:
                     self.logger.warning(f"第 {page} 页获取失败")
+                    failed_pages.append(page)
+                    print(f"⚠️  第 {page} 页获取失败")
                     continue
 
                 items = self.api_fetcher.parse_list_response(response)
 
                 if not items:
                     self.logger.info(f"第 {page} 页无数据，停止翻页")
-                    print(f"第 {page} 页无数据，停止翻页")
+                    print(f"✅ 第 {page} 页无数据，停止翻页")
                     break
 
                 page_total = self.api_fetcher.get_total_count(response)
                 total_count = page_total
 
-                print(f"本页获取 {len(items)} 条，总计 {page_total} 条")
+                print(f"📄 本页获取 {len(items)} 条，总计 {page_total} 条")
 
                 for item in items:
                     doc = self._parse_item(item, cat_key)
                     if doc and self.db.insert_document(doc):
                         success_count += 1
 
-                print(f"已入库 {success_count} 条")
+                self._print_progress(page, total_pages, success_count)
+                
+                self.total_pages_processed += 1
+                self.total_items_saved += success_count
 
+                if page < total_pages:
+                    self._page_delay()
+
+            stats = self.api_fetcher.get_stats()
+            print(f"\n{'='*60}")
+            print(f"✅ 分类处理完成")
+            print(f"   - 成功入库: {success_count} 条")
+            print(f"   - 失败页面: {len(failed_pages)} 页 {failed_pages if failed_pages else ''}")
+            print(f"   - 总请求数: {stats['total_requests']}")
+            print(f"   - 连续失败: {stats['consecutive_failures']}")
+            print(f"   - 当前延迟倍数: {stats['current_delay_multiplier']:.2f}x")
+            print(f"   - 使用 curl_cffi: {'✓' if stats['using_curl_cffi'] else '✗'}")
+            print(f"{'='*60}\n")
+            
             self.logger.info(f"分类 {cat_info['name']} 处理完成，共入库 {success_count} 条")
-            print(f"\n分类处理完成，共入库 {success_count} 条")
 
     def _parse_item(self, item: Dict, category_key: str) -> Dict:
         """

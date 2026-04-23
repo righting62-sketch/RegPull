@@ -1,5 +1,5 @@
 """
-页面抓取（使用Scrapling）
+页面抓取（使用Scrapling）- 增强版反爬虫策略
 """
 import time
 import random
@@ -12,56 +12,141 @@ from config.settings import REQUEST_CONFIG, SCRAPLING_CONFIG
 
 
 class PageFetcher:
-    """页面抓取类"""
+    """页面抓取类 - 增强版"""
 
     def __init__(self):
         self.stealthy_fetcher = StealthyFetcher()
         self.dynamic_fetcher = DynamicFetcher()
         self._download_result = None
         self._content_result = None
+        self.request_count = 0
+        self.consecutive_failures = 0
+        self.current_delay_multiplier = 1.0
 
-    def fetch_page(self, url: str, use_dynamic: bool = False) -> Optional[object]:
+    def _calculate_adaptive_delay(self) -> float:
+        """计算自适应延迟时间"""
+        base_delay = random.uniform(
+            REQUEST_CONFIG['delay_min'],
+            REQUEST_CONFIG['delay_max']
+        )
+        
+        if self.consecutive_failures > 0:
+            multiplier = min(self.current_delay_multiplier * 1.5, 5.0)
+            self.current_delay_multiplier = multiplier
+        else:
+            self.current_delay_multiplier = max(1.0, self.current_delay_multiplier * 0.9)
+        
+        adaptive_delay = base_delay * self.current_delay_multiplier
+        
+        return min(adaptive_delay, 30.0)
+
+    def _exponential_backoff(self, retry_count: int) -> float:
+        """指数退避算法"""
+        base_delay = REQUEST_CONFIG['retry_delay_base']
+        max_delay = REQUEST_CONFIG['retry_delay_max']
+        
+        delay = base_delay * (2 ** retry_count)
+        delay = min(delay, max_delay)
+        
+        jitter = random.uniform(0, delay * 0.3)
+        
+        return delay + jitter
+
+    def _smart_sleep(self, delay: float, reason: str = ""):
+        """智能休眠"""
+        if reason:
+            print(f"💤 休眠 {delay:.2f} 秒 ({reason})...")
+        time.sleep(delay)
+
+    def _check_page_blocked(self, page) -> bool:
+        """检查页面是否被拦截"""
+        try:
+            page_text = page.get_all_text().lower()
+            for indicator in REQUEST_CONFIG['firewall_indicators']:
+                if indicator.lower() in page_text:
+                    return True
+            
+            title = page.css('title')
+            if title:
+                title_text = title[0].get_all_text().lower()
+                if '403' in title_text or 'forbidden' in title_text or 'blocked' in title_text:
+                    return True
+            
+            return False
+        except:
+            return False
+
+    def fetch_page(self, url: str, use_dynamic: bool = False, max_retries: int = None) -> Optional[object]:
         """
-        抓取页面
+        抓取页面 - 增强版
 
         Args:
             url: 页面URL
             use_dynamic: 是否使用动态渲染
+            max_retries: 最大重试次数
 
         Returns:
             Scrapling Response对象
         """
-        try:
-            if use_dynamic:
-                response = self.dynamic_fetcher.fetch(
-                    url,
-                    headless=SCRAPLING_CONFIG.get('headless', True),
-                    network_idle=True
-                )
-            else:
-                response = self.stealthy_fetcher.fetch(
-                    url,
-                    headless=SCRAPLING_CONFIG.get('headless', True)
-                )
+        if max_retries is None:
+            max_retries = REQUEST_CONFIG['max_retries']
 
-            delay = random.uniform(
-                REQUEST_CONFIG['delay_min'],
-                REQUEST_CONFIG['delay_max']
-            )
-            time.sleep(delay)
+        for retry_count in range(max_retries):
+            try:
+                if use_dynamic:
+                    response = self.dynamic_fetcher.fetch(
+                        url,
+                        headless=SCRAPLING_CONFIG.get('headless', True),
+                        network_idle=True
+                    )
+                else:
+                    response = self.stealthy_fetcher.fetch(
+                        url,
+                        headless=SCRAPLING_CONFIG.get('headless', True)
+                    )
 
-            return response
+                if self._check_page_blocked(response):
+                    print("❌ 警告：检测到页面被防火墙拦截！")
+                    self.consecutive_failures += 1
+                    
+                    if retry_count < max_retries - 1:
+                        backoff_delay = self._exponential_backoff(retry_count)
+                        print(f"🔄 将在 {backoff_delay:.2f} 秒后重试 (第 {retry_count + 2}/{max_retries} 次)...")
+                        self._smart_sleep(backoff_delay, "防火墙拦截退避")
+                        continue
+                    else:
+                        print("❌ 已达到最大重试次数")
+                        return None
 
-        except Exception as e:
-            print(f"页面抓取失败: {e}")
-            return None
+                self.consecutive_failures = 0
+                self.request_count += 1
+                
+                delay = self._calculate_adaptive_delay()
+                self._smart_sleep(delay, "请求间隔")
 
-    def fetch_and_process_page(self, url: str) -> Tuple[str, Optional[str]]:
+                return response
+
+            except Exception as e:
+                self.consecutive_failures += 1
+                print(f"⚠️  页面抓取失败 (第 {retry_count + 1}/{max_retries} 次): {e}")
+                
+                if retry_count < max_retries - 1:
+                    backoff_delay = self._exponential_backoff(retry_count)
+                    print(f"🔄 将在 {backoff_delay:.2f} 秒后重试...")
+                    self._smart_sleep(backoff_delay, "异常重试退避")
+                else:
+                    print(f"❌ 已达到最大重试次数")
+                    return None
+
+        return None
+
+    def fetch_and_process_page(self, url: str, max_retries: int = None) -> Tuple[str, Optional[str]]:
         """
-        抓取页面并处理：提取正文和获取下载链接
+        抓取页面并处理：提取正文和获取下载链接 - 增强版
 
         Args:
             url: 页面URL
+            max_retries: 最大重试次数
 
         Returns:
             (正文内容, 下载链接URL)
@@ -69,60 +154,111 @@ class PageFetcher:
         content = ""
         download_url = None
 
-        try:
-            page = self.dynamic_fetcher.fetch(
-                url,
-                headless=SCRAPLING_CONFIG.get('headless', True),
-                network_idle=True
-            )
+        if max_retries is None:
+            max_retries = REQUEST_CONFIG['max_retries']
 
-            if not page:
-                print("  页面抓取失败")
+        for retry_count in range(max_retries):
+            try:
+                page = self.dynamic_fetcher.fetch(
+                    url,
+                    headless=SCRAPLING_CONFIG.get('headless', True),
+                    network_idle=True
+                )
+
+                if not page:
+                    print("  页面抓取失败")
+                    if retry_count < max_retries - 1:
+                        backoff_delay = self._exponential_backoff(retry_count)
+                        self._smart_sleep(backoff_delay, "页面抓取失败重试")
+                        continue
+                    return content, download_url
+
+                if self._check_page_blocked(page):
+                    print("❌ 警告：检测到页面被防火墙拦截！")
+                    self.consecutive_failures += 1
+                    
+                    if retry_count < max_retries - 1:
+                        backoff_delay = self._exponential_backoff(retry_count)
+                        self._smart_sleep(backoff_delay, "防火墙拦截退避")
+                        continue
+                    return content, download_url
+
+                content = self.extract_content(page)
+                print(f"  提取正文: {len(content)} 字符")
+
+                download_url = self.get_download_url(page)
+
+                self.consecutive_failures = 0
+                self.request_count += 1
+                
+                delay = self._calculate_adaptive_delay()
+                self._smart_sleep(delay, "请求间隔")
+
                 return content, download_url
 
-            content = self.extract_content(page)
-            print(f"  提取正文: {len(content)} 字符")
+            except Exception as e:
+                self.consecutive_failures += 1
+                print(f"  ⚠️  页面处理失败 (第 {retry_count + 1}/{max_retries} 次): {e}")
+                
+                if retry_count < max_retries - 1:
+                    backoff_delay = self._exponential_backoff(retry_count)
+                    self._smart_sleep(backoff_delay, "异常重试退避")
+                else:
+                    return content, download_url
 
-            download_url = self.get_download_url(page)
+        return content, download_url
 
-            delay = random.uniform(
-                REQUEST_CONFIG['delay_min'],
-                REQUEST_CONFIG['delay_max']
-            )
-            time.sleep(delay)
-
-            return content, download_url
-
-        except Exception as e:
-            print(f"  页面处理失败: {e}")
-            return content, download_url
-
-    def fetch_click_and_download(self, url: str) -> Tuple[str, Optional[str]]:
+    def fetch_click_and_download(self, url: str, max_retries: int = None) -> Tuple[str, Optional[str]]:
         """
-        抓取页面，提取正文，并点击下载按钮获取文件
+        抓取页面，提取正文，并点击下载按钮获取文件 - 增强版
 
         Args:
             url: 页面URL
+            max_retries: 最大重试次数
 
         Returns:
             (正文内容, 下载文件临时路径)
         """
-        self._download_result = None
-        self._content_result = ""
+        if max_retries is None:
+            max_retries = REQUEST_CONFIG['max_retries']
 
-        try:
-            self.dynamic_fetcher.fetch(
-                url,
-                headless=SCRAPLING_CONFIG.get('headless', True),
-                network_idle=True,
-                page_action=self._click_download_action
-            )
+        for retry_count in range(max_retries):
+            self._download_result = None
+            self._content_result = ""
 
-            return self._content_result, self._download_result
+            try:
+                self.dynamic_fetcher.fetch(
+                    url,
+                    headless=SCRAPLING_CONFIG.get('headless', True),
+                    network_idle=True,
+                    page_action=self._click_download_action
+                )
 
-        except Exception as e:
-            print(f"  页面处理失败: {e}")
-            return self._content_result, self._download_result
+                if self._content_result or self._download_result:
+                    self.consecutive_failures = 0
+                    self.request_count += 1
+                    
+                    delay = self._calculate_adaptive_delay()
+                    self._smart_sleep(delay, "请求间隔")
+                    
+                    return self._content_result, self._download_result
+                
+                if retry_count < max_retries - 1:
+                    backoff_delay = self._exponential_backoff(retry_count)
+                    self._smart_sleep(backoff_delay, "结果为空重试")
+                    continue
+
+            except Exception as e:
+                self.consecutive_failures += 1
+                print(f"  ⚠️  页面处理失败 (第 {retry_count + 1}/{max_retries} 次): {e}")
+                
+                if retry_count < max_retries - 1:
+                    backoff_delay = self._exponential_backoff(retry_count)
+                    self._smart_sleep(backoff_delay, "异常重试退避")
+                else:
+                    return self._content_result, self._download_result
+
+        return self._content_result, self._download_result
 
     def _click_download_action(self, page) -> None:
         """
@@ -375,3 +511,11 @@ class PageFetcher:
                     })
 
         return attachments
+
+    def get_stats(self) -> Dict:
+        """获取请求统计信息"""
+        return {
+            'total_requests': self.request_count,
+            'consecutive_failures': self.consecutive_failures,
+            'current_delay_multiplier': self.current_delay_multiplier
+        }

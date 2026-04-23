@@ -1,31 +1,105 @@
 """
-模块二运行入口
+模块二运行入口 - 增强版反爬虫策略
 """
 import os
 import json
 import argparse
 import shutil
+import random
+import time
 from typing import List, Dict, Optional, Tuple
 from database.db_manager import TaxDocumentDB
-from config.settings import DB_PATH, KNOWLEDGE_BASE_DIR
+from config.settings import DB_PATH, KNOWLEDGE_BASE_DIR, REQUEST_CONFIG
 from config.category_mapping import CATEGORY_NAMES
 from utils.helpers import sanitize_filename, ensure_dir
 from utils.logger import setup_logger
 from .page_fetcher import PageFetcher
-import requests
+
+try:
+    from curl_cffi import requests as curl_requests
+    USE_CURL_CFFI = True
+except ImportError:
+    import requests as curl_requests
+    USE_CURL_CFFI = False
 
 
 class DetailDownloader:
-    """详情页下载器"""
+    """详情页下载器 - 增强版"""
 
     def __init__(self):
         self.db = TaxDocumentDB(DB_PATH)
         self.logger = setup_logger('module2', 'module2.log')
         self.page_fetcher = PageFetcher()
-        self.session = requests.Session()
+        self.session = curl_requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'User-Agent': random.choice(REQUEST_CONFIG['user_agents'])
         })
+        self.download_count = 0
+        self.consecutive_failures = 0
+        self.current_delay_multiplier = 1.0
+
+    def _calculate_adaptive_delay(self) -> float:
+        """计算自适应延迟时间"""
+        base_delay = random.uniform(
+            REQUEST_CONFIG['delay_min'],
+            REQUEST_CONFIG['delay_max']
+        )
+        
+        if self.consecutive_failures > 0:
+            multiplier = min(self.current_delay_multiplier * 1.5, 5.0)
+            self.current_delay_multiplier = multiplier
+        else:
+            self.current_delay_multiplier = max(1.0, self.current_delay_multiplier * 0.9)
+        
+        adaptive_delay = base_delay * self.current_delay_multiplier
+        
+        return min(adaptive_delay, 30.0)
+
+    def _exponential_backoff(self, retry_count: int) -> float:
+        """指数退避算法"""
+        base_delay = REQUEST_CONFIG['retry_delay_base']
+        max_delay = REQUEST_CONFIG['retry_delay_max']
+        
+        delay = base_delay * (2 ** retry_count)
+        delay = min(delay, max_delay)
+        
+        jitter = random.uniform(0, delay * 0.3)
+        
+        return delay + jitter
+
+    def _smart_sleep(self, delay: float, reason: str = ""):
+        """智能休眠"""
+        if reason:
+            print(f"💤 休眠 {delay:.2f} 秒 ({reason})...")
+        time.sleep(delay)
+
+    def _document_delay(self):
+        """文档间延迟"""
+        delay = random.uniform(
+            REQUEST_CONFIG['page_delay_min'],
+            REQUEST_CONFIG['page_delay_max']
+        )
+        print(f"💤 文档间休眠 {delay:.2f} 秒以规避风控...\n")
+        time.sleep(delay)
+
+    def _check_download_blocked(self, response) -> bool:
+        """检查下载是否被拦截"""
+        if response.status_code == 403:
+            return True
+        
+        content_type = response.headers.get('Content-Type', '')
+        if 'text/html' in content_type and len(response.content) < 5000:
+            try:
+                text = response.text.lower()
+                for indicator in REQUEST_CONFIG['firewall_indicators']:
+                    if indicator.lower() in text:
+                        return True
+            except:
+                pass
+        
+        return False
 
     def process_documents(self, limit: int = None, category: str = None):
         """
@@ -56,7 +130,20 @@ class DetailDownloader:
             else:
                 fail_count += 1
 
-        print(f"\n处理完成: 成功 {success_count}, 失败 {fail_count}")
+            if i < len(documents):
+                self._document_delay()
+
+        print(f"\n{'='*60}")
+        print(f"✅ 处理完成")
+        print(f"   - 成功: {success_count}")
+        print(f"   - 失败: {fail_count}")
+        print(f"   - 总下载: {self.download_count}")
+        
+        stats = self.page_fetcher.get_stats()
+        print(f"   - 页面请求: {stats['total_requests']}")
+        print(f"   - 连续失败: {stats['consecutive_failures']}")
+        print(f"   - 延迟倍数: {stats['current_delay_multiplier']:.2f}x")
+        print(f"{'='*60}")
 
     def _process_single_document(self, doc: Dict) -> bool:
         """
@@ -118,20 +205,20 @@ class DetailDownloader:
                     )
 
                     print(f"  下载附件: {name[:30]}")
-                    if self._download_file(url, save_path):
+                    if self._download_file_with_retry(url, save_path):
                         saved_paths.append(save_path)
 
             if saved_paths:
                 local_path = '|'.join(saved_paths)
                 self.db.update_download_status(doc['id'], local_path)
-                print(f"  保存成功: {len(saved_paths)} 个文件")
+                print(f"  ✅ 保存成功: {len(saved_paths)} 个文件")
                 return True
 
             return False
 
         except Exception as e:
             self.logger.error(f"处理文档失败: {doc['id']}, 错误: {e}")
-            print(f"  处理失败: {e}")
+            print(f"  ❌ 处理失败: {e}")
             return False
 
     def _save_downloaded_file(self, temp_path: str, doc: Dict) -> Optional[str]:
@@ -230,32 +317,79 @@ class DetailDownloader:
             print(f"    文本保存失败: {e}")
             return False
 
-    def _download_file(self, url: str, save_path: str) -> bool:
+    def _download_file_with_retry(self, url: str, save_path: str, max_retries: int = None) -> bool:
         """
-        下载文件
+        下载文件 - 增强版（带重试机制）
 
         Args:
             url: 文件URL
             save_path: 保存路径
+            max_retries: 最大重试次数
 
         Returns:
             是否成功
         """
-        try:
-            ensure_dir(os.path.dirname(save_path))
+        if max_retries is None:
+            max_retries = REQUEST_CONFIG['max_retries']
 
-            response = self.session.get(url, timeout=60, stream=True)
-            response.raise_for_status()
+        for retry_count in range(max_retries):
+            try:
+                ensure_dir(os.path.dirname(save_path))
 
-            with open(save_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                headers = {
+                    'User-Agent': random.choice(REQUEST_CONFIG['user_agents'])
+                }
 
-            return True
+                request_kwargs = {
+                    'url': url,
+                    'headers': headers,
+                    'timeout': 60,
+                    'stream': True
+                }
 
-        except Exception as e:
-            print(f"    文件下载失败: {e}")
-            return False
+                if USE_CURL_CFFI:
+                    request_kwargs['impersonate'] = REQUEST_CONFIG['impersonate_browser']
+
+                response = self.session.get(**request_kwargs)
+
+                if self._check_download_blocked(response):
+                    print(f"    ⚠️  下载被拦截 (第 {retry_count + 1}/{max_retries} 次)")
+                    self.consecutive_failures += 1
+                    
+                    if retry_count < max_retries - 1:
+                        backoff_delay = self._exponential_backoff(retry_count)
+                        self._smart_sleep(backoff_delay, "下载拦截退避")
+                        continue
+                    else:
+                        print(f"    ❌ 已达到最大重试次数")
+                        return False
+
+                response.raise_for_status()
+
+                with open(save_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                self.consecutive_failures = 0
+                self.download_count += 1
+                
+                delay = self._calculate_adaptive_delay()
+                self._smart_sleep(delay, "下载间隔")
+
+                return True
+
+            except Exception as e:
+                self.consecutive_failures += 1
+                print(f"    ⚠️  文件下载失败 (第 {retry_count + 1}/{max_retries} 次): {e}")
+                
+                if retry_count < max_retries - 1:
+                    backoff_delay = self._exponential_backoff(retry_count)
+                    self._smart_sleep(backoff_delay, "下载重试退避")
+                else:
+                    print(f"    ❌ 已达到最大重试次数")
+                    return False
+
+        return False
 
 
 def run_module2(limit: int = None, category: str = None, show_stats: bool = False):
@@ -292,6 +426,7 @@ def run_module2(limit: int = None, category: str = None, show_stats: bool = Fals
     if limit:
         print(f"数量限制: {limit}")
 
+    print(f"使用 curl_cffi: {'✓' if USE_CURL_CFFI else '✗'}")
     print("=" * 60)
 
     downloader = DetailDownloader()
