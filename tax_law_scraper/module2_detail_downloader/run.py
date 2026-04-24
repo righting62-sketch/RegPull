@@ -14,6 +14,7 @@ from config.category_mapping import CATEGORY_NAMES
 from utils.helpers import sanitize_filename, ensure_dir
 from utils.logger import setup_logger
 from .page_fetcher import PageFetcher
+from datetime import datetime
 
 try:
     from curl_cffi import requests as curl_requests
@@ -174,10 +175,11 @@ class DetailDownloader:
                     doc['doc_number'],
                     doc['title'],
                     'txt',
-                    suffix='_正文'
+                    suffix='_正文',
+                    doc_status=doc.get('status', '')
                 )
                 print(f"  保存正文: {os.path.basename(content_path)}")
-                if self._save_text(content, content_path):
+                if self._save_text(content, content_path, doc):
                     saved_paths.append(content_path)
 
             if download_temp_path and os.path.exists(download_temp_path):
@@ -201,11 +203,12 @@ class DetailDownloader:
                         doc['doc_number'],
                         doc['title'],
                         ext,
-                        suffix=f'_{name}' if name else f'_附件{idx}'
+                        suffix=f'_{name}' if name else f'_附件{idx}',
+                        doc_status=doc.get('status', '')
                     )
 
                     print(f"  下载附件: {name[:30]}")
-                    if self._download_file_with_retry(url, save_path):
+                    if self._download_file_with_retry(url, save_path, doc=doc, file_type='attachment'):
                         saved_paths.append(save_path)
 
             if saved_paths:
@@ -243,7 +246,8 @@ class DetailDownloader:
                 doc['doc_number'],
                 doc['title'],
                 ext,
-                suffix='_文档'
+                suffix='_文档',
+                doc_status=doc.get('status', '')
             )
 
             ensure_dir(os.path.dirname(final_path))
@@ -271,7 +275,27 @@ class DetailDownloader:
             ext = 'pdf'
         return ext
 
-    def _generate_save_path(self, category: str, doc_number: str, title: str, ext: str, suffix: str = '') -> str:
+    def _get_status_label(self, doc_status: str) -> str:
+        """
+        根据文档状态获取标签
+
+        Args:
+            doc_status: 文档状态
+
+        Returns:
+            状态标签
+        """
+        status_label_map = {
+            '全文废止': '【废止】',
+            '全文失效': '【失效】',
+            '全文有效': '【有效】',
+            '部分有效': '【部分有效】',
+            '部分废止': '【部分废止】',
+            '部分失效': '【部分失效】',
+        }
+        return status_label_map.get(doc_status, f'【{doc_status}】' if doc_status else '')
+
+    def _generate_save_path(self, category: str, doc_number: str, title: str, ext: str, suffix: str = '', doc_status: str = '') -> str:
         """
         生成保存路径
 
@@ -281,6 +305,7 @@ class DetailDownloader:
             title: 标题
             ext: 扩展名
             suffix: 文件名后缀
+            doc_status: 文档状态（用于文件标记）
 
         Returns:
             保存路径
@@ -289,18 +314,22 @@ class DetailDownloader:
         safe_doc_number = sanitize_filename(doc_number) if doc_number else '无文号'
         safe_title = sanitize_filename(title)
 
-        filename = f"{safe_doc_number}_{safe_title}{suffix}.{ext}"
+        # 根据状态添加标签
+        status_prefix = self._get_status_label(doc_status)
+
+        filename = f"{status_prefix}{safe_doc_number}_{safe_title}{suffix}.{ext}"
         filename = filename[:200]
 
         return os.path.join(KNOWLEDGE_BASE_DIR, category_name, filename)
 
-    def _save_text(self, content: str, save_path: str) -> bool:
+    def _save_text(self, content: str, save_path: str, doc: Dict = None) -> bool:
         """
         保存文本内容
 
         Args:
             content: 文本内容
             save_path: 保存路径
+            doc: 文档信息（用于生成元数据）
 
         Returns:
             是否成功
@@ -317,7 +346,68 @@ class DetailDownloader:
             print(f"    文本保存失败: {e}")
             return False
 
-    def _download_file_with_retry(self, url: str, save_path: str, max_retries: int = None) -> bool:
+    def _is_effective_status(self, doc_status: str) -> bool:
+        """
+        判断状态是否为有效状态
+
+        Args:
+            doc_status: 文档状态
+
+        Returns:
+            是否有效
+        """
+        # 定义有效状态列表
+        effective_statuses = ['全文有效', '部分有效']
+        return doc_status in effective_statuses
+
+    def _generate_meta_file(self, file_path: str, doc: Dict, file_type: str):
+        """
+        生成文件元数据
+
+        Args:
+            file_path: 文件路径
+            doc: 文档信息
+            file_type: 文件类型 (content/document/attachment)
+        """
+        try:
+            doc_status = doc.get('status', '')
+            is_effective = self._is_effective_status(doc_status)
+            label = self._get_status_label(doc_status)
+
+            meta = {
+                'doc_id': doc.get('id'),
+                'title': doc.get('title'),
+                'doc_number': doc.get('doc_number'),
+                'category': doc.get('category'),
+                'document_status': doc_status,
+                'is_effective': is_effective,
+                'label': label,
+                'file_type': file_type,
+                'file_path': file_path,
+                'source_url': doc.get('detail_url'),
+                'download_time': datetime.now().isoformat()
+            }
+
+            meta_path = f"{file_path}.meta.json"
+            with open(meta_path, 'w', encoding='utf-8') as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+
+            # 同时记录到数据库
+            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            file_record = {
+                'doc_id': doc.get('id'),
+                'file_path': file_path,
+                'file_type': file_type,
+                'file_status': 'valid' if is_effective else 'invalid',
+                'source_url': doc.get('detail_url'),
+                'file_size': file_size
+            }
+            self.db.insert_downloaded_file(file_record)
+
+        except Exception as e:
+            print(f"    生成元数据失败: {e}")
+
+    def _download_file_with_retry(self, url: str, save_path: str, max_retries: int = None, doc: Dict = None, file_type: str = 'attachment') -> bool:
         """
         下载文件 - 增强版（带重试机制）
 
@@ -325,6 +415,8 @@ class DetailDownloader:
             url: 文件URL
             save_path: 保存路径
             max_retries: 最大重试次数
+            doc: 文档信息（用于生成元数据）
+            file_type: 文件类型
 
         Returns:
             是否成功
